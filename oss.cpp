@@ -22,11 +22,16 @@ struct PCB {
     int start_nano;
     int messagesSent;
     int workerID;
+    int serviceTimeSec; // total seconds process has been "scheduled"
+    int serviceTimeNano; // total nanoseconds process has been "scheduled"
+    int eventWaitSec; // time in seconds the process will become unblocked
+    int eventWaitNano; // time in nanoseconds the process will become unblocked
+    int blocked; // 1 if blocked, 0 if not
 };
 
 struct MessageBuffer {
     long mtype;
-    int process_running; // 1 if running, 0 if not
+    int time_q; // time quantum in nanoseconds
 };
 
 // Globals
@@ -36,21 +41,16 @@ int *shm_clock;
 int *sec;
 vector <PCB> table(20);
 const int increment_amount = 10000;
+const int time_quantum = 50000000; // 50 ms in nanoseconds
 static int nextWorkerID = 0;
 
 // setup message queue
 key_t msg_key = ftok("oss.cpp", 1);
 int msgid = msgget(msg_key, IPC_CREAT | 0666);
 
-void increment_clock(int* sec, int* nano, int running_children) {
+void increment_clock(int* sec, int* nano, long long inc_ns) {
     const long long NSEC_PER_SEC = 1000000000LL;
-    const long long BASE_INC_NS = 250000000LL; // 250 ms in ns
-
-    // If there are children, divide the 250ms evenly among them.
-    // If no children, advance by full 250ms.
-    long long inc_ns = (running_children > 0) ? (BASE_INC_NS / running_children) : BASE_INC_NS;
-    if (inc_ns <= 0) inc_ns = 1; // guard against zero
-
+    if (inc_ns <= 0) inc_ns = 1; // guard against non-positive increments
     long long total = (long long)(*nano) + inc_ns;
     *sec += (int)(total / NSEC_PER_SEC);
     *nano = (int)(total % NSEC_PER_SEC);
@@ -315,7 +315,7 @@ int main(int argc, char* argv[]) {
     // Initialize random number generator
     random_device rd;
     mt19937 gen(rd());
-    uniform_real_distribution<double> dis(1, time_limit);
+    uniform_real_distribution<double> dis(0, time_limit);
 
     // open log file if specified
     ofstream log_fs;
@@ -355,8 +355,6 @@ int main(int argc, char* argv[]) {
     int message_count = 0;
 
     while (launched_processes < proc || running_processes > 0) {
-        increment_clock(sec, nano, running_processes);
-
         // send message to next worker in round-robin fashion
         pid_t next_worker_pid = select_next_worker(table);
         int target_idx = -1;
@@ -379,8 +377,8 @@ int main(int argc, char* argv[]) {
 
             // prepare and send message to the selected worker
             sndMessage.mtype = next_worker_pid;
-            sndMessage.process_running = 1;
-            if (msgsnd(msgid, &sndMessage, sizeof(sndMessage.process_running), 0) == -1) {
+            sndMessage.time_q = time_quantum; // time quantum in nanoseconds
+            if (msgsnd(msgid, &sndMessage, sizeof(sndMessage.time_q), 0) == -1) {
                 cerr << "msgsnd";
                 exit_handler();
             }
@@ -391,30 +389,43 @@ int main(int argc, char* argv[]) {
 
             // receive reply from worker we just pinged
             MessageBuffer rcvMessage;
-            if (msgrcv(msgid, &rcvMessage, sizeof(rcvMessage.process_running), getpid(), 0) == -1) {
+            if (msgrcv(msgid, &rcvMessage, sizeof(rcvMessage.time_q), getpid(), 0) == -1) {
                 cerr << "msgrcv";
                 exit_handler();
             }
 
             {
                 ostringstream ss;
-                ss << "OSS: Received reply from worker " << table[target_idx].workerID << " process_running=" << rcvMessage.process_running
-                   << " PID " << next_worker_pid << " at " << *sec << " seconds and " << *nano << " nanoseconds." << endl;
+                ss << "OSS: Received reply from worker " << table[target_idx].workerID
+                   << " PID " << next_worker_pid << " ran for " << rcvMessage.time_q << " nanoseconds." << endl;
                 oss_log(ss.str());
             }
 
             // If worker reported it is done, clean up PCB and counters
-            if (rcvMessage.process_running == 0) {
+            if (rcvMessage.time_q < 0) {
+                int worker_runtime = rcvMessage.time_q / -1; // convert to positive
+                increment_clock(sec, nano, worker_runtime); // advance clock by worker runtime
                 {
                     ostringstream ss;
-                    ss << "OSS: Worker " << table[target_idx].workerID << " PID " << next_worker_pid << " has decided to terminate." << endl;
+                    ss << "OSS: Worker " << table[target_idx].workerID << " PID " << next_worker_pid
+                    << " terminated after running for " << worker_runtime << " nanoseconds." << endl;
                     oss_log(ss.str());
                 }
-                 wait(0);
-                 remove_pcb(table, next_worker_pid);
-                 running_processes = max(0, running_processes - 1);
-             }
-         }
+                wait(0);
+                remove_pcb(table, next_worker_pid);
+                running_processes = max(0, running_processes - 1);  
+            }
+            else if (rcvMessage.time_q == time_quantum) { // if worker is continuing
+                increment_clock(sec, nano, rcvMessage.time_q); // increment clock by time quantum
+                // update service time for the worker
+                table[target_idx].serviceTimeNano += rcvMessage.time_q;
+                if (table[target_idx].serviceTimeNano >= NSEC_PER_SEC) {
+                    table[target_idx].serviceTimeSec += table[target_idx].serviceTimeNano / NSEC_PER_SEC;
+                    table[target_idx].serviceTimeNano = table[target_idx].serviceTimeNano % NSEC_PER_SEC;
+                }   
+                
+            }
+        }
 
         // call print_process_table every half-second of simulated time
         {
@@ -437,6 +448,7 @@ int main(int argc, char* argv[]) {
             table[pcb_index].pid = worker_pid;
             table[pcb_index].start_sec = *sec;
             table[pcb_index].start_nano = *nano;
+            table[pcb_index].messagesSent = 0;
             table[pcb_index].workerID = ++nextWorkerID;
 
             launched_processes++;

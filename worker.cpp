@@ -6,12 +6,13 @@
 #include <string>
 #include <cstdlib>
 #include <errno.h>
+#include <climits>
 
 using namespace std;
 
 struct MessageBuffer {
     long mtype;
-    int process_running; // 1 if running, 0 if not
+    int time_q; // time quantum in nanoseconds
 };
 
 int main(int argc, char* argv[]) {
@@ -51,64 +52,71 @@ int main(int argc, char* argv[]) {
          << "Called With:" << endl
          << "Interval: " << target_seconds << " seconds, " << target_nano << " nanoseconds" << endl;
 
-    // calculate termination time
-    int end_seconds = *sec + target_seconds;
-    int end_nano = *nano + target_nano;
-    if (end_nano >= 1000000000) {
-        end_seconds += end_nano / 1000000000;
-        end_nano = end_nano % 1000000000;
-    }
+    // target interval (how much CPU time this worker needs) in seconds/nanoseconds
+    // we'll compare accumulated run_time against this target interval
+    const long long NSEC_PER_SEC = 1000000000LL;
+    long long target_total_ns = (long long)target_seconds * NSEC_PER_SEC + (long long)target_nano;
 
-    // worker just staring message
-    cout << "Worker PID:" << getpid() << " PPID:" << getppid() << endl
-         << "SysClockS: " << *sec << " SysclockNano: " << *nano << " TermTimeS: " << end_seconds << " TermTimeNano: " << end_nano << endl
-         << "--Just Starting" << endl;
-
-    // message-driven loop: block until OSS tells us to check the clock
-    MessageBuffer msg;
-    pid_t oss_pid = getppid();
-    int message_count = 0;
-
-    while (true) {
-        // block until oss sends a message addressed to this worker (mtype == this pid)
-        if (msgrcv(msgid, &msg, sizeof(msg.process_running), getpid(), 0) == -1) {
-            if (errno == EINTR) continue;
-            cerr << "msgrcv failed" << endl;
-            break;
-        }
-
-        // Print message received
-        cout << "Worker PID:" << getpid() << " PPID:" << getppid() << endl
-         << "SysClockS: " << *sec << " SysclockNano: " << *nano << " TermTimeS: " << end_seconds << " TermTimeNano: " << end_nano << endl
-         << "-- " << ++message_count << " messages received from oss" << endl;
-
-        // After receiving the ping, check if it's time to terminate
-        bool should_terminate = ((*sec > end_seconds) || (*sec == end_seconds && *nano >= end_nano));
-
-        if (should_terminate) {
-            // print terminating message
+    int run_time_sec = 0;
+    int run_time_nano = 0;
+ 
+     // worker just staring message
+     cout << "Worker PID:" << getpid() << " PPID:" << getppid() << endl
+          << "SysClockS: " << *sec << " SysclockNano: " << *nano << " TermTimeS: " << target_seconds << " TermTimeNano: " << target_nano << endl
+          << "--Just Starting" << endl;
+ 
+     // message-driven loop: block until OSS tells us to check the clock
+     MessageBuffer rcv_message;
+     pid_t oss_pid = getppid();
+ 
+     while (true) {
+         // block until oss sends a message addressed to this worker (mtype == this pid)
+         if (msgrcv(msgid, &rcv_message, sizeof(rcv_message.time_q), getpid(), 0) == -1) {
+             if (errno == EINTR) continue;
+             cerr << "msgrcv failed" << endl;
+             break;
+         }
+ 
+         // increase process run time
+        // increment run time by the quantum we received
+        long long before_total = (long long)run_time_sec * NSEC_PER_SEC + (long long)run_time_nano;
+        long long after_total = before_total + (long long)rcv_message.time_q;
+        // normalize run_time
+        run_time_sec = (int)(after_total / NSEC_PER_SEC);
+        run_time_nano = (int)(after_total % NSEC_PER_SEC);
+ 
+        // decide if we've reached the target interval
+        if (after_total >= target_total_ns) {
+            // how much of the last quantum was actually used to reach the target?
+            long long used_in_last_quantum = target_total_ns - before_total;
+            if (used_in_last_quantum < 0) used_in_last_quantum = 0;
+            if (used_in_last_quantum > rcv_message.time_q) used_in_last_quantum = rcv_message.time_q;
+ 
+            MessageBuffer term_msg;
+            term_msg.mtype = (long)oss_pid;
+            term_msg.time_q = - (int) used_in_last_quantum; // negative indicates termination + how many ns used in last quantum
+ 
             cout << "Worker PID:" << getpid() << " PPID:" << getppid() << endl
-                 << "SysClockS: " << *sec << " SysclockNano: " << *nano << " TermTimeS: " << end_seconds << " TermTimeNano: " << end_nano << endl
-                 << "--Terminating after sending message back to oss after " << message_count << " received messages." << endl;
-
-            // notify OSS that this process is no longer running (process_running = 0)
-            MessageBuffer reply;
-            reply.mtype = (long)oss_pid;
-            reply.process_running = 0;
-            if (msgsnd(msgid, &reply, sizeof(reply.process_running), 0) == -1) {
+                 << "SysClockS: " << *sec << " SysclockNano: " << *nano << " TargetInterval: " << target_seconds << "s " << target_nano << "ns" << endl
+                 << "-- Terminating after " << run_time_sec << " seconds and " << used_in_last_quantum << " nanoseconds of run time." << endl;
+ 
+            if (msgsnd(msgid, &term_msg, sizeof(term_msg.time_q), 0) == -1) {
                 cerr << "msgsnd failed" << endl;
             }
-            break; // exit loop and terminate
+            break;
         } else {
-            // notify OSS that this process is still running (process_running = 1)
-            MessageBuffer reply;
-            reply.mtype = (long)oss_pid;
-            reply.process_running = 1;
-            if (msgsnd(msgid, &reply, sizeof(reply.process_running), 0) == -1) {
+            // still need more time, reply that we used the full quantum
+            MessageBuffer cont_msg;
+            cont_msg.mtype = (long)oss_pid;
+            cont_msg.time_q = rcv_message.time_q; // indicate we used the full quantum
+            cout << "Worker PID:" << getpid() << " PPID:" << getppid() << endl
+                 << "SysClockS: " << *sec << " SysclockNano: " << *nano << endl
+                 << "-- Continuing after " << run_time_sec << "s " << run_time_nano << "ns of run time." << endl;
+            if (msgsnd(msgid, &cont_msg, sizeof(cont_msg.time_q), 0) == -1) {
                 cerr << "msgsnd failed" << endl;
             }
         }
-    }
-    shmdt(clock);
-    return 0;
+     }
+     shmdt(clock);
+     return 0;
 }
