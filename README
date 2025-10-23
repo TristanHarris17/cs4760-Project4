@@ -1,0 +1,23 @@
+Name: Tristan Harris
+Date: 10/9/2025 
+Environment: Linux (WSL), Visual Studio Code
+Version Control: GitHub https://github.com/TristanHarris17/cs4760-Project2.git
+How to compile the project:
+Type ’make’
+Example of how to run the project:
+./oss -n 3 -s 2 -t 4 -i 0.6 -f log.txt
+
+Generative AI used: chatgpt
+Prompts: 
+    What is causing the redefinition of struct msgbuf error.
+    Modify the increment_clock function to increment the clock by 250ms divided by the number of current children running.
+    Fix the error in my select_next_worker function so that it selects workers in a round robin fashion and explain the changes made.
+    Give a method to write only OSS output to a log file if one is specified.
+    Add input checking for all program inputs 
+
+Summary: 
+    Fixed the error with message buffers (name collision)
+    Successfully modified the increment_clock_function
+    Got the select_next_worker function working but didn't explain the changes in a detalied way
+    recommended sstream for writing to the log file and wrote the helper function for logging messages
+    Added try catch blocks but didn't account for the shared memory and message queues that where created already so I added the exit_handler function
