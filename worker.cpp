@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <errno.h>
 #include <climits>
+#include <random>
 
 using namespace std;
 
@@ -47,6 +48,12 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
 
+    // initalize random number generator
+    random_device rd;
+    mt19937 gen(rd());
+    uniform_int_distribution<> blocked_dist(0, 99); // 10% chance to block
+    uniform_int_distribution<> block_time_dist(1000000, 40000000); // block time between 1ms and 40ms
+
     // Print starting message
     cout << "Worker starting, " << "PID:" << getpid() << " PPID:" << getppid() << endl
          << "Called With:" << endl
@@ -77,20 +84,24 @@ int main(int argc, char* argv[]) {
              break;
          }
  
-         // increase process run time
-        // increment run time by the quantum we received
+        // compute run-time totals before consuming any of this quantum
+        const long long NSEC_PER_SEC = 1000000000LL;
         long long before_total = (long long)run_time_sec * NSEC_PER_SEC + (long long)run_time_nano;
-        long long after_total = before_total + (long long)rcv_message.time_q;
-        // normalize run_time
-        run_time_sec = (int)(after_total / NSEC_PER_SEC);
-        run_time_nano = (int)(after_total % NSEC_PER_SEC);
+ 
+        // get random number to decide if process should become blocked
+        int rand_num = blocked_dist(gen);
  
         // decide if we've reached the target interval
-        if (after_total >= target_total_ns) {
+        if (before_total + (long long)rcv_message.time_q >= target_total_ns) {
             // how much of the last quantum was actually used to reach the target?
             long long used_in_last_quantum = target_total_ns - before_total;
             if (used_in_last_quantum < 0) used_in_last_quantum = 0;
             if (used_in_last_quantum > rcv_message.time_q) used_in_last_quantum = rcv_message.time_q;
+ 
+            // update run_time to reflect actual usage
+            long long new_total = before_total + used_in_last_quantum;
+            run_time_sec = (int)(new_total / NSEC_PER_SEC);
+            run_time_nano = (int)(new_total % NSEC_PER_SEC);
  
             MessageBuffer term_msg;
             term_msg.mtype = (long)oss_pid;
@@ -98,20 +109,44 @@ int main(int argc, char* argv[]) {
  
             cout << "Worker PID:" << getpid() << " PPID:" << getppid() << endl
                  << "SysClockS: " << *sec << " SysclockNano: " << *nano << " TargetInterval: " << target_seconds << "s " << target_nano << "ns" << endl
-                 << "-- Terminating after " << run_time_sec << " seconds and " << used_in_last_quantum << " nanoseconds of run time." << endl;
+                 << "-- Terminating after " << run_time_sec << "s " << run_time_nano << "ns of total run time." << endl;
  
             if (msgsnd(msgid, &term_msg, sizeof(term_msg.time_q), 0) == -1) {
                 cerr << "msgsnd failed" << endl;
             }
             break;
+        } else if (rand_num < 10) { // 10% chance to block
+            // decide how much time was actually used before blocking
+            int time_used = block_time_dist(gen);
+            if (time_used > rcv_message.time_q) time_used = rcv_message.time_q;
+ 
+            // update run_time to reflect the actual used time before blocking
+            long long new_total = before_total + (long long)time_used;
+            run_time_sec = (int)(new_total / NSEC_PER_SEC);
+            run_time_nano = (int)(new_total % NSEC_PER_SEC);
+ 
+            MessageBuffer block_msg;
+            block_msg.mtype = (long)oss_pid;
+            block_msg.time_q = time_used; // random time used before blocking
+            cout << "Worker PID:" << getpid() << " PPID:" << getppid() << endl
+                 << "SysClockS: " << *sec << " SysclockNano: " << *nano << endl
+                 << "-- Blocking after " << run_time_sec << "s " << run_time_nano << "ns of total run time." << endl;
+            if (msgsnd(msgid, &block_msg, sizeof(block_msg.time_q), 0) == -1) {
+                cerr << "msgsnd failed" << endl;
+            }
         } else {
-            // still need more time, reply that we used the full quantum
+            // used the entire quantum; update run_time accordingly
+            long long used = (long long)rcv_message.time_q;
+            long long new_total = before_total + used;
+            run_time_sec = (int)(new_total / NSEC_PER_SEC);
+            run_time_nano = (int)(new_total % NSEC_PER_SEC);
+ 
             MessageBuffer cont_msg;
             cont_msg.mtype = (long)oss_pid;
             cont_msg.time_q = rcv_message.time_q; // indicate we used the full quantum
             cout << "Worker PID:" << getpid() << " PPID:" << getppid() << endl
                  << "SysClockS: " << *sec << " SysclockNano: " << *nano << endl
-                 << "-- Continuing after " << run_time_sec << "s " << run_time_nano << "ns of run time." << endl;
+                 << "-- Continuing with " << run_time_sec << "s " << run_time_nano << "ns of total run time." << endl;
             if (msgsnd(msgid, &cont_msg, sizeof(cont_msg.time_q), 0) == -1) {
                 cerr << "msgsnd failed" << endl;
             }

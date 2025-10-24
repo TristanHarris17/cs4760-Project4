@@ -12,6 +12,7 @@
 #include <random>
 #include <fstream>
 #include <sstream>
+#include <climits>
 
 using namespace std;
 
@@ -185,6 +186,26 @@ static inline bool optarg_blank(const char* s) {
     return (s == nullptr) || (s[0] == '\0');
 }
 
+void unblock_ready_processes(std::vector<PCB> &table, int *sec, int *nano) {
+    const long long NSEC_PER_SEC = 1000000000LL;
+    long long current_total = (long long)(*sec) * NSEC_PER_SEC + (long long)(*nano);
+
+    for (size_t i = 0; i < table.size(); ++i) {
+        PCB &p = table[i];
+        if (p.occupied && p.blocked) {
+            long long event_total = (long long)p.eventWaitSec * NSEC_PER_SEC + (long long)p.eventWaitNano;
+            if (current_total >= event_total) {
+                p.blocked = 0;
+                p.eventWaitSec = 0;
+                p.eventWaitNano = 0;
+                // simple log to stdout; replace with oss_log(...) if you want logging to file too
+                cout << "OSS: Unblocking worker " << p.workerID << " PID " << p.pid
+                     << " at " << *sec << "s " << *nano << "ns." << endl;
+            }
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
     //parse command line args
     int proc = -1;
@@ -355,6 +376,48 @@ int main(int argc, char* argv[]) {
     int message_count = 0;
 
     while (launched_processes < proc || running_processes > 0) {
+        // check if any processes should be changed from blocked to ready
+        unblock_ready_processes(table, sec, nano);
+
+        // check if all processes are blocked
+        bool all_blocked = true;
+        for (const PCB &p : table) {
+            if (p.occupied && p.blocked == 0) {
+                all_blocked = false;
+                break;
+            }
+        }
+        if (all_blocked) {
+            // find the process with the earliest unblock time
+            long long earliest_unblock_total = LLONG_MAX;
+            for (const PCB &p : table) {
+                if (p.occupied && p.blocked) {
+                    long long event_total = (long long)p.eventWaitSec * NSEC_PER_SEC + (long long)p.eventWaitNano;
+                    if (event_total < earliest_unblock_total) {
+                        earliest_unblock_total = event_total;
+                    }
+                }
+            }
+            // advance clock to that time
+            if (earliest_unblock_total != LLONG_MAX) {
+                long long current_total = (long long)(*sec) * NSEC_PER_SEC + (long long)(*nano);
+                if (earliest_unblock_total > current_total) {
+                    long long diff = earliest_unblock_total - current_total;
+                    increment_clock(sec, nano, diff);
+                    // log clock advancement
+                    {
+                        ostringstream ss;
+                        ss << "OSS: All processes blocked, advancing clock to "
+                           << *sec << "s " << *nano << "ns " << endl;
+                        oss_log(ss.str());
+                    }
+                    unblock_ready_processes(table, sec, nano);
+                }
+            }
+        }
+
+        // TODO change round-robin to scheduling algorithm
+
         // send message to next worker in round-robin fashion
         pid_t next_worker_pid = select_next_worker(table);
         int target_idx = -1;
@@ -423,9 +486,32 @@ int main(int argc, char* argv[]) {
                     table[target_idx].serviceTimeSec += table[target_idx].serviceTimeNano / NSEC_PER_SEC;
                     table[target_idx].serviceTimeNano = table[target_idx].serviceTimeNano % NSEC_PER_SEC;
                 }   
-                
+            }
+            else if (rcvMessage.time_q > 0 && rcvMessage.time_q < time_quantum) { // worker decided to block
+                increment_clock(sec, nano, rcvMessage.time_q); // increment clock by reported time
+                // update service time for the worker
+                table[target_idx].serviceTimeNano += rcvMessage.time_q;
+                if (table[target_idx].serviceTimeNano >= NSEC_PER_SEC) {
+                    table[target_idx].serviceTimeSec += table[target_idx].serviceTimeNano / NSEC_PER_SEC;
+                    table[target_idx].serviceTimeNano = table[target_idx].serviceTimeNano % NSEC_PER_SEC;
+                }
+                // set process to blocked state for 0.6 seconds
+                table[target_idx].blocked = 1;
+                // calculate unblock time (current time + 0.6 seconds)
+                long long current_total = (long long)(*sec) * NSEC_PER_SEC + (long long)(*nano);
+                long long unblock_total = current_total + 600000000LL; // 0.6 seconds in nanoseconds
+                table[target_idx].eventWaitSec = (int)(unblock_total / NSEC_PER_SEC);
+                table[target_idx].eventWaitNano = (int)(unblock_total % NSEC_PER_SEC);
+                {
+                    ostringstream ss;
+                    ss << "OSS: Worker " << table[target_idx].workerID << " PID " << next_worker_pid
+                    << " is blocked until " << table[target_idx].eventWaitSec << "s "
+                    << table[target_idx].eventWaitNano << "ns." << endl;
+                    oss_log(ss.str());
+                }
             }
         }
+        // TODO increment clock by fixed amount for scheduling decision simulation
 
         // call print_process_table every half-second of simulated time
         {
