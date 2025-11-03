@@ -52,14 +52,14 @@ key_t msg_key = ftok("oss.cpp", 1);
 int msgid = msgget(msg_key, IPC_CREAT | 0666);
 
 // global log stream and helper so other functions can log to the same place as main
-std::ofstream log_fs;
+ofstream log_fs;
 static const size_t MAX_LOG_LINES = 10000;
 static size_t log_lines_written = 0;
-static inline void oss_log_msg(const std::string &s) {
+static inline void oss_log_msg(const string &s) {
     // always print to stdout
-    std::cout << s;
-    if (!log_fs.is_open()) return;    
-    size_t newlines = std::count(s.begin(), s.end(), '\n'); // count how many new lines this message contains
+    cout << s;
+    if (!log_fs.is_open()) return;
+    size_t newlines = count(s.begin(), s.end(), '\n'); // count how many new lines this message contains
     if (log_lines_written >= MAX_LOG_LINES) return; // if limit is reached, skip
     if (log_lines_written + newlines > MAX_LOG_LINES) return; // skip message if it would exceed limit
     // else write the whole message and update counter
@@ -222,7 +222,7 @@ pid_t select_next_worker(const vector<PCB> &table) {
 
     // build a single log message for the ratios and write it via oss_log_msg
     {
-        std::ostringstream ss;
+        ostringstream ss;
         ss << "OSS: Scheduling ratios at " << shm_clock[0] << "s " << shm_clock[1] << "ns\n";
         for (const auto &e : entries) {
             int idx = e.second;

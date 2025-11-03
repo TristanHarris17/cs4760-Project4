@@ -5,11 +5,18 @@ Version Control: GitHub https://github.com/TristanHarris17/cs4760-Project4
 How to compile the project:
 Type ’make’
 Example of how to run the project:
-
+./oss -n 4 -s 4 -t 1 -i 0 -f log.txt
 
 Generative AI used: chatgpt
 Prompts: 
+Change the increment_clock function to take a amount of time in nanoseconds to increase they clock by
+Add a message that prints the ratios of the processes int order into the select_next_worker function using the osstringstream ss
+select_next_worker should also output the message to the log file if one is provided
+Limit the log file to only the first 10k lines
 
 
 Summary: 
-
+Changed the increment_clock function properly but left it the part where it changed the time based on the amount of children running
+Added the message that prints the ratios in order but used cout instead of the osstringstream 
+Fixed the issue and changed the cout to the osstringstream also changed the file stream to global and created a helper function to allow the other functions to print the the same log file
+Added code to limit the log file if a message was too long it would just print part of the message so I modified it to just skip the message if that was the case
