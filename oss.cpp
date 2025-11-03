@@ -13,6 +13,7 @@
 #include <fstream>
 #include <sstream>
 #include <climits>
+#include <algorithm>
 
 using namespace std;
 
@@ -28,6 +29,7 @@ struct PCB {
     int eventWaitSec; // time in seconds the process will become unblocked
     int eventWaitNano; // time in nanoseconds the process will become unblocked
     int blocked; // 1 if blocked, 0 if not
+    long long last_scheduled_ns; // last scheduled time in nanoseconds
 };
 
 struct MessageBuffer {
@@ -48,6 +50,23 @@ static int nextWorkerID = 0;
 // setup message queue
 key_t msg_key = ftok("oss.cpp", 1);
 int msgid = msgget(msg_key, IPC_CREAT | 0666);
+
+// global log stream and helper so other functions can log to the same place as main
+std::ofstream log_fs;
+static const size_t MAX_LOG_LINES = 10000;
+static size_t log_lines_written = 0;
+static inline void oss_log_msg(const std::string &s) {
+    // always print to stdout
+    std::cout << s;
+    if (!log_fs.is_open()) return;    
+    size_t newlines = std::count(s.begin(), s.end(), '\n'); // count how many new lines this message contains
+    if (log_lines_written >= MAX_LOG_LINES) return; // if limit is reached, skip
+    if (log_lines_written + newlines > MAX_LOG_LINES) return; // skip message if it would exceed limit
+    // else write the whole message and update counter
+    log_fs << s;
+    log_fs.flush();
+    log_lines_written += newlines;
+}
 
 void increment_clock(int* sec, int* nano, long long inc_ns) {
     const long long NSEC_PER_SEC = 1000000000LL;
@@ -167,18 +186,62 @@ void exit_handler() {
 }
 
 pid_t select_next_worker(const vector<PCB> &table) {
-    static int last_idx = -1;
-    size_t n = table.size();
-    if (n == 0) return (pid_t)-1;
-    // try each slot once, starting after last_idx
-    for (size_t i = 1; i <= n; ++i) {
-        size_t idx = (last_idx + i) % n;
-        if (table[idx].occupied) {
-            last_idx = (int)idx;
-            return table[idx].pid;
+    const long long NSEC_PER_SEC = 1000000000LL;
+
+    // read current simulated time
+    if (shm_clock == nullptr) return (pid_t)-1;
+    long long current_total = (long long)shm_clock[0] * NSEC_PER_SEC + (long long)shm_clock[1];
+
+    // collect (ratio, index) for every occupied and unblocked process
+    vector<pair<double,int>> entries;
+    entries.reserve(table.size());
+    for (size_t i = 0; i < table.size(); ++i) {
+        const PCB &p = table[i];
+        if (!p.occupied || p.blocked) continue;
+
+        long long service_ns = (long long)p.serviceTimeSec * NSEC_PER_SEC + (long long)p.serviceTimeNano;
+        long long start_total = (long long)p.start_sec * NSEC_PER_SEC + (long long)p.start_nano;
+        long long time_in_system = current_total - start_total;
+
+        double ratio;
+        if (time_in_system <= 0) {
+            // denominator zero or negative ratio  = 0
+            ratio = 0.0;
+        } else {
+            ratio = (double)service_ns / (double)time_in_system;
         }
+
+        entries.emplace_back(ratio, (int)i);
     }
-    return (pid_t)-1;
+
+    // sort by ratio ascending, tie-break by PID ascending
+    sort(entries.begin(), entries.end(), [&](const pair<double,int>& a, const pair<double,int>& b){
+        if (a.first != b.first) return a.first < b.first;
+        return table[a.second].pid < table[b.second].pid;
+    });
+
+    // build a single log message for the ratios and write it via oss_log_msg
+    {
+        std::ostringstream ss;
+        ss << "OSS: Scheduling ratios at " << shm_clock[0] << "s " << shm_clock[1] << "ns\n";
+        for (const auto &e : entries) {
+            int idx = e.second;
+            const PCB &p = table[idx];
+            ss << "  idx=" << idx
+               << " pid=" << p.pid
+               << " ratio=" << std::fixed << std::setprecision(6) << e.first
+               << " service=" << p.serviceTimeSec << "s" << p.serviceTimeNano << "ns"
+               << " start=" << p.start_sec << "s" << p.start_nano << "ns"
+               << "\n";
+        }
+        ss << std::flush;
+        oss_log_msg(ss.str());
+    }
+
+    if (entries.empty()) return (pid_t)-1;
+
+    // return pid of smallest-ratio entry
+    return table[entries.front().second].pid;
 }
 
 // helper to detect empty/blank optarg
@@ -189,6 +252,7 @@ static inline bool optarg_blank(const char* s) {
 void unblock_ready_processes(std::vector<PCB> &table, int *sec, int *nano) {
     const long long NSEC_PER_SEC = 1000000000LL;
     long long current_total = (long long)(*sec) * NSEC_PER_SEC + (long long)(*nano);
+    std::ostringstream ss;
 
     for (size_t i = 0; i < table.size(); ++i) {
         PCB &p = table[i];
@@ -198,11 +262,14 @@ void unblock_ready_processes(std::vector<PCB> &table, int *sec, int *nano) {
                 p.blocked = 0;
                 p.eventWaitSec = 0;
                 p.eventWaitNano = 0;
-                // simple log to stdout; replace with oss_log(...) if you want logging to file too
-                cout << "OSS: Unblocking worker " << p.workerID << " PID " << p.pid
-                     << " at " << *sec << "s " << *nano << "ns." << endl;
+                ss << "OSS: Unblocking worker " << p.workerID << " PID " << p.pid
+                   << " at " << *sec << "s " << *nano << "ns." << std::endl;
             }
         }
+    }
+
+    if (!ss.str().empty()) {
+        oss_log_msg(ss.str());
     }
 }
 
@@ -331,7 +398,7 @@ int main(int argc, char* argv[]) {
     // signal handling
     signal(SIGALRM, signal_handler);
     signal(SIGINT, signal_handler);
-    alarm(60);
+    alarm(3);
 
     // Initialize random number generator
     random_device rd;
@@ -339,7 +406,6 @@ int main(int argc, char* argv[]) {
     uniform_real_distribution<double> dis(0, time_limit);
 
     // open log file if specified
-    ofstream log_fs;
     if (!log_file.empty()) {
         log_fs.open(log_file);
         if (!log_fs) {
@@ -347,8 +413,9 @@ int main(int argc, char* argv[]) {
             exit(1);
         }
     }
-
+ 
     // helper to log messages originating from OSS (writes to stdout and to log file if open)
+    // main still uses a local lambda name `oss_log` in many places; keep it forwarding to the global file
     auto oss_log = [&](const string &s) {
         cout << s;
         if (log_fs.is_open()) log_fs << s;
@@ -373,9 +440,39 @@ int main(int argc, char* argv[]) {
     long long next_launch_total = 0; 
 
     MessageBuffer sndMessage;
+
+    // statistics
     int message_count = 0;
+    long long total_blocked_time_ns = 0;
+    long long total_cpu_time_ns = 0;
+    long long total_idle_time_ns = 0;
+    long long total_wait_time_ns = 0;
+
 
     while (launched_processes < proc || running_processes > 0) {
+        // Check if it's time to launch a new worker
+        long long current_total = (long long)(*sec) * NSEC_PER_SEC + (long long)(*nano);
+        if (launched_processes < proc && running_processes < simul && current_total >= next_launch_total) {
+            float worker_time = dis(gen);
+            pid_t worker_pid = launch_worker(worker_time);
+
+            // Find empty slot in PCB array and populate it with new process info
+            int pcb_index = find_empty_pcb(table);
+            table[pcb_index].occupied = true;
+            table[pcb_index].pid = worker_pid;
+            table[pcb_index].start_sec = *sec;
+            table[pcb_index].start_nano = *nano;
+            table[pcb_index].messagesSent = 0;
+            table[pcb_index].workerID = ++nextWorkerID;
+
+            launched_processes++;
+            running_processes++;
+
+            // Update the next allowed launch time
+            next_launch_total = current_total + launch_interval_nano;
+            print_process_table(table);
+        }
+
         // check if any processes should be changed from blocked to ready
         unblock_ready_processes(table, sec, nano);
 
@@ -405,6 +502,7 @@ int main(int argc, char* argv[]) {
                     long long diff = earliest_unblock_total - current_total;
                     increment_clock(sec, nano, diff);
                     // log clock advancement
+                    total_idle_time_ns += diff;
                     {
                         ostringstream ss;
                         ss << "OSS: All processes blocked, advancing clock to "
@@ -415,8 +513,6 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
-
-        // TODO change round-robin to scheduling algorithm
 
         // send message to next worker in round-robin fashion
         pid_t next_worker_pid = select_next_worker(table);
@@ -433,8 +529,7 @@ int main(int argc, char* argv[]) {
 
             {
                 ostringstream ss;
-                ss << "OSS: Sending message to worker " << table[target_idx].workerID
-                   << " PID " << next_worker_pid <<  " at " << *sec << " seconds and " << *nano << " nanoseconds." << endl;
+                ss << "OSS: Scheduling worker " << "PID " << next_worker_pid <<  " at " << *sec << " seconds and " << *nano << " nanoseconds." << endl;
                 oss_log(ss.str());
             }
 
@@ -450,6 +545,13 @@ int main(int argc, char* argv[]) {
             table[target_idx].messagesSent++;
             message_count++;
 
+            // update total wait time
+            long long current_total = (long long)(*sec) * NSEC_PER_SEC + (long long)(*nano);
+            long long wait_time = current_total - table[target_idx].last_scheduled_ns;
+            if (wait_time > 0) {
+                total_wait_time_ns += wait_time;
+            }
+
             // receive reply from worker we just pinged
             MessageBuffer rcvMessage;
             if (msgrcv(msgid, &rcvMessage, sizeof(rcvMessage.time_q), getpid(), 0) == -1) {
@@ -457,12 +559,7 @@ int main(int argc, char* argv[]) {
                 exit_handler();
             }
 
-            {
-                ostringstream ss;
-                ss << "OSS: Received reply from worker " << table[target_idx].workerID
-                   << " PID " << next_worker_pid << " ran for " << rcvMessage.time_q << " nanoseconds." << endl;
-                oss_log(ss.str());
-            }
+            table[target_idx].last_scheduled_ns = (long long)(*sec) * NSEC_PER_SEC + (long long)(*nano); // update last scheduled time
 
             // If worker reported it is done, clean up PCB and counters
             if (rcvMessage.time_q < 0) {
@@ -470,8 +567,7 @@ int main(int argc, char* argv[]) {
                 increment_clock(sec, nano, worker_runtime); // advance clock by worker runtime
                 {
                     ostringstream ss;
-                    ss << "OSS: Worker " << table[target_idx].workerID << " PID " << next_worker_pid
-                    << " terminated after running for " << worker_runtime << " nanoseconds." << endl;
+                    ss << "OSS: Worker " << "PID " << next_worker_pid << " terminated after running for " << worker_runtime << " nanoseconds." << endl;
                     oss_log(ss.str());
                 }
                 wait(0);
@@ -480,12 +576,18 @@ int main(int argc, char* argv[]) {
             }
             else if (rcvMessage.time_q == time_quantum) { // if worker is continuing
                 increment_clock(sec, nano, rcvMessage.time_q); // increment clock by time quantum
+                total_cpu_time_ns += rcvMessage.time_q;
                 // update service time for the worker
                 table[target_idx].serviceTimeNano += rcvMessage.time_q;
                 if (table[target_idx].serviceTimeNano >= NSEC_PER_SEC) {
                     table[target_idx].serviceTimeSec += table[target_idx].serviceTimeNano / NSEC_PER_SEC;
                     table[target_idx].serviceTimeNano = table[target_idx].serviceTimeNano % NSEC_PER_SEC;
-                }   
+                }  
+                {
+                    ostringstream ss;
+                    ss << "OSS: Received reply from worker " << "PID " << next_worker_pid << " ran for " << rcvMessage.time_q << " nanoseconds." << endl;
+                    oss_log(ss.str());
+                } 
             }
             else if (rcvMessage.time_q > 0 && rcvMessage.time_q < time_quantum) { // worker decided to block
                 increment_clock(sec, nano, rcvMessage.time_q); // increment clock by reported time
@@ -497,6 +599,7 @@ int main(int argc, char* argv[]) {
                 }
                 // set process to blocked state for 0.6 seconds
                 table[target_idx].blocked = 1;
+                total_blocked_time_ns += 600000000LL; // 0.6 seconds in nanoseconds
                 // calculate unblock time (current time + 0.6 seconds)
                 long long current_total = (long long)(*sec) * NSEC_PER_SEC + (long long)(*nano);
                 long long unblock_total = current_total + 600000000LL; // 0.6 seconds in nanoseconds
@@ -504,14 +607,13 @@ int main(int argc, char* argv[]) {
                 table[target_idx].eventWaitNano = (int)(unblock_total % NSEC_PER_SEC);
                 {
                     ostringstream ss;
-                    ss << "OSS: Worker " << table[target_idx].workerID << " PID " << next_worker_pid
+                    ss << "OSS: Worker " << "PID " << next_worker_pid
                     << " is blocked until " << table[target_idx].eventWaitSec << "s "
                     << table[target_idx].eventWaitNano << "ns." << endl;
                     oss_log(ss.str());
                 }
             }
         }
-        // TODO increment clock by fixed amount for scheduling decision simulation
 
         // call print_process_table every half-second of simulated time
         {
@@ -522,28 +624,8 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Check if it's time to launch a new worker
-        long long current_total = (long long)(*sec) * NSEC_PER_SEC + (long long)(*nano);
-        if (launched_processes < proc && running_processes < simul && current_total >= next_launch_total) {
-            float worker_time = dis(gen);
-            pid_t worker_pid = launch_worker(worker_time);
-
-            // Find empty slot in PCB array and populate it with new process info
-            int pcb_index = find_empty_pcb(table);
-            table[pcb_index].occupied = true;
-            table[pcb_index].pid = worker_pid;
-            table[pcb_index].start_sec = *sec;
-            table[pcb_index].start_nano = *nano;
-            table[pcb_index].messagesSent = 0;
-            table[pcb_index].workerID = ++nextWorkerID;
-
-            launched_processes++;
-            running_processes++;
-
-            // Update the next allowed launch time
-            next_launch_total = current_total + launch_interval_nano;
-            print_process_table(table);
-        }
+        // increment simulated clock by fixed amount
+        increment_clock(sec, nano, 1000); 
     }
 
     {
@@ -551,6 +633,21 @@ int main(int argc, char* argv[]) {
         ss << "OSS terminating after reaching process limit and all workers have finished." << endl;
         ss << "Number of processes launched: " << launched_processes << endl;
         ss << "Number of messages sent: " << message_count << endl;
+        ss << "Total CPU time: " << total_cpu_time_ns / 1e9 << " seconds" << endl;
+        ss << "total idle time: " << total_idle_time_ns / 1e9 << " seconds" << endl;
+        ss << "Total blocked time: " << total_blocked_time_ns / 1e9 << " seconds" << endl;
+        ss << "Average blocked time per process: " 
+           << (launched_processes > 0 ? (total_blocked_time_ns / launched_processes) / 1e9 : 0.0) 
+           << " seconds" << endl;
+        ss << "Average wait time per process: " 
+           << (launched_processes > 0 ? (total_wait_time_ns / launched_processes) / 1e9 : 0.0) 
+           << " seconds" << endl;
+
+        double total_time_simulated = (double)(*sec) + ((double)(*nano) / 1e9);
+        double cpu_utilization = (total_time_simulated > 0.0) ? 
+                                 ((double)total_cpu_time_ns / 1e9) / total_time_simulated * 100.0 : 0.0;
+        ss << "CPU Utilization: " << fixed << setprecision(2) << cpu_utilization << "%" << endl;
+
         oss_log(ss.str());
     }
  
