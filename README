@@ -9,13 +9,15 @@ Example of how to run the project:
 
 Generative AI used: chatgpt
 Prompts: 
-Change the increment_clock function to take a amount of time in nanoseconds to increase they clock by
+Where is the bug in worker that is causing the workers to terminate at incorrect times after a worker has already terminated so if -n is anything greater than 1
+Change the increment_clock function to take an amount of time in nanoseconds to increase the clock by
 Add a message that prints the ratios of the processes int order into the select_next_worker function using the osstringstream ss
 select_next_worker should also output the message to the log file if one is provided
 Limit the log file to only the first 10k lines
 
 
 Summary: 
+Fixed the bug i was comparing run time to end_seconds but end_seconds was being calculated using the shared clock + target interval which would cause the process to run for the interval time plus however long all other processes had been running
 Changed the increment_clock function properly but left it the part where it changed the time based on the amount of children running
 Added the message that prints the ratios in order but used cout instead of the osstringstream 
 Fixed the issue and changed the cout to the osstringstream also changed the file stream to global and created a helper function to allow the other functions to print the the same log file

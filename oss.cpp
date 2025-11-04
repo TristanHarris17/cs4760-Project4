@@ -24,8 +24,8 @@ struct PCB {
     int start_nano;
     int messagesSent;
     int workerID;
-    int serviceTimeSec; // total seconds process has been "scheduled"
-    int serviceTimeNano; // total nanoseconds process has been "scheduled"
+    int serviceTimeSec; // total seconds process has been scheduled
+    int serviceTimeNano; // total nanoseconds process has been scheduled
     int eventWaitSec; // time in seconds the process will become unblocked
     int eventWaitNano; // time in nanoseconds the process will become unblocked
     int blocked; // 1 if blocked, 0 if not
@@ -252,7 +252,7 @@ static inline bool optarg_blank(const char* s) {
 void unblock_ready_processes(std::vector<PCB> &table, int *sec, int *nano) {
     const long long NSEC_PER_SEC = 1000000000LL;
     long long current_total = (long long)(*sec) * NSEC_PER_SEC + (long long)(*nano);
-    std::ostringstream ss;
+    ostringstream ss;
 
     for (size_t i = 0; i < table.size(); ++i) {
         PCB &p = table[i];
@@ -294,7 +294,7 @@ int main(int argc, char* argv[]) {
                     << "  -i launch_interval Interval between launching worker processes in seconds (non-negative float)\n"
                     << "  -f logfile        Log file name (optional)\n"
                     << "Example:\n"
-                    << "  ./oss -n 10 -s 3 -t 2.5 -i 0.5 -f oss.log\n";
+                    << "  ./oss -n 10 -s 3 -t 2.5 -i 0.5 -f log.txt\n";
                 exit_handler();
             }
             case 'n': {
@@ -464,6 +464,12 @@ int main(int argc, char* argv[]) {
             table[pcb_index].start_nano = *nano;
             table[pcb_index].messagesSent = 0;
             table[pcb_index].workerID = ++nextWorkerID;
+            table[pcb_index].serviceTimeSec = 0;
+            table[pcb_index].serviceTimeNano = 0;
+            table[pcb_index].eventWaitSec = 0;
+            table[pcb_index].eventWaitNano = 0;
+            table[pcb_index].blocked = 0;
+            table[pcb_index].last_scheduled_ns = (long long)(*sec) * NSEC_PER_SEC + (long long)(*nano);
 
             launched_processes++;
             running_processes++;
@@ -628,6 +634,7 @@ int main(int argc, char* argv[]) {
         increment_clock(sec, nano, 1000); 
     }
 
+    // final report
     {
         ostringstream ss;
         ss << "OSS terminating after reaching process limit and all workers have finished." << endl;

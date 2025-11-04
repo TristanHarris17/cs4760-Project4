@@ -60,7 +60,6 @@ int main(int argc, char* argv[]) {
          << "Interval: " << target_seconds << " seconds, " << target_nano << " nanoseconds" << endl;
 
     // target interval (how much CPU time this worker needs) in seconds/nanoseconds
-    // we'll compare accumulated run_time against this target interval
     const long long NSEC_PER_SEC = 1000000000LL;
     long long target_total_ns = (long long)target_seconds * NSEC_PER_SEC + (long long)target_nano;
 
@@ -77,7 +76,7 @@ int main(int argc, char* argv[]) {
      pid_t oss_pid = getppid();
  
      while (true) {
-         // block until oss sends a message addressed to this worker (mtype == this pid)
+         // block until oss sends a message to this worker
          if (msgrcv(msgid, &rcv_message, sizeof(rcv_message.time_q), getpid(), 0) == -1) {
              if (errno == EINTR) continue;
              cerr << "msgrcv failed" << endl;
@@ -93,7 +92,7 @@ int main(int argc, char* argv[]) {
  
         // decide if we've reached the target interval
         if (before_total + (long long)rcv_message.time_q >= target_total_ns) {
-            // how much of the last quantum was actually used to reach the target?
+            // how much of the last quantum was actually used to reach the target
             long long used_in_last_quantum = target_total_ns - before_total;
             if (used_in_last_quantum < 0) used_in_last_quantum = 0;
             if (used_in_last_quantum > rcv_message.time_q) used_in_last_quantum = rcv_message.time_q;
